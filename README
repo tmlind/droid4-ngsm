@@ -1,0 +1,21 @@
+droid4-ngsm ts27010 utility
+
+This program initializes ts27010 line discipline on droid 4 modem uart
+so other programs such as ModemManager and ofono can use the /dev/gsmtty*
+ports.
+
+At some point n_gsm will probably be initialized by a Linux kernel serdev
+driver, so any code using /dev/gsmtty* ports should already assume that
+the ports may already be initialized.
+
+This program may add support to proxy some of the ts27010 channels needed
+to use the W3GLTE modem in addition to the MDM6600 modem. And it may at
+some point have support to send AT commands to the ts27010 channels from
+command line for testing.
+
+For now it can be just used initialize the line discipline. And make a
+speaker phone test call after setting alsamixer to "Call" and doing:
+
+$ droid4-ngsm --call=123456789
+
+Then just hit Ctrl-C when done.
