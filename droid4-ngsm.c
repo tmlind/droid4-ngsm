@@ -252,11 +252,18 @@ static int stop_phone_call(char *buf, size_t buf_sz)
 	return 0;
 }
 
+enum modem_state {
+	MODEM_STATE_DISCONNECTED,
+	MODEM_STATE_CONNECTED,
+	MODEM_STATE_CALLING,
+};
+
 int main(int argc, char **argv)
 {
 	struct sigaction handler;
 	struct termios t;
 	const char *port = "/dev/ttyS0";
+	enum modem_state state;
 	int fd, error, i;
 	char *buf;
 
@@ -334,6 +341,7 @@ int main(int argc, char **argv)
 				error = start_phone_call(buf, BUF_SZ, argv[1]);
 				if (error)
 					goto disable;
+				state = MODEM_STATE_CALLING;
 
 				break;
 			}
@@ -360,12 +368,17 @@ int main(int argc, char **argv)
 
 	fprintf(stdout, "Started ngsm, press Ctrl-C to exit when done\n");
 	while (1) {
-		sleep(2);
+		if (state == MODEM_STATE_CALLING) {
+			error = test_ngsm(1, "AT+CLCC", buf, BUF_SZ);
+			if (error)
+				break;
+		}
 		if (signal_received)
 			break;
+		sleep(2);
 	}
 
-	if (!strncmp("--call=", argv[1], 7)) {
+	if (state == MODEM_STATE_CALLING) {
 		fprintf(stdout, "Hanging up..\n");
 		error = stop_phone_call(buf, BUF_SZ);
 	}
