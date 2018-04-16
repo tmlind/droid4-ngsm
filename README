@@ -19,3 +19,15 @@ speaker phone test call after setting alsamixer to "Call" and doing:
 $ droid4-ngsm --call=123456789
 
 Then just hit Ctrl-C when done.
+
+To debug what AT commands Android is using, you can do the following:
+
+# echo 0x7fffffff > /sys/module/ts27010mux/parameters/debug_level
+# dmesg | grep ts27010 | grep AT
+ts27010: >C 3025AT+COPS?
+ts27010: >C 3026AT+CREG?
+...
+
+Note that with n_gsm you need to use the DLCI numbers, not the device
+numbers used by the ts27010 driver. So DLCI 1 means /dev/gsmtty1, while
+ts27010 driver uses /dev/mux0 for DLCI1.
