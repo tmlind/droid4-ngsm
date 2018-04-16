@@ -325,7 +325,7 @@ int main(int argc, char **argv)
 			goto free;
 		}
 
-		fprintf(stdout, "Testing ngsm..\n");
+		fprintf(stdout, "Testing ngsm.. (few failures are normal)\n");
 		error = test_ngsm(1, "AT+CFUN?", buf, BUF_SZ);
 		if (!error) {
 			fprintf(stdout, "Enable speaker phone..\n");
@@ -387,7 +387,7 @@ disable:
 	fprintf(stdout, "Disable speaker phone..\n");
 	error = disable_speaker_phone(buf, BUF_SZ);
 	if (error)
-		fprintf(stderr, "Could not disable spearke phone: %s\n",
+		fprintf(stderr, "Could not disable speaker phone: %s\n",
 			strerror(errno));
 
 free:
