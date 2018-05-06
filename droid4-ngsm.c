@@ -11,20 +11,76 @@
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #include <linux/gsmmux.h>
 #include <linux/tty.h>
 
 #define BUF_SZ		4096
+#define CMD_BUF_SZ	256
 
 enum modem_state {
+	MODEM_STATE_NONE,
 	MODEM_STATE_DISCONNECTED,
 	MODEM_STATE_CONNECTED,
+	MODEM_STATE_ENABLED,
 	MODEM_STATE_CALLING,
+	MODEM_STATE_DISABLED,
+	MODEM_STATE_EXITING,
+};
+
+enum dlci_index {
+	DLCI1,
+	DLCI2,
+	DLCI3,
+	DLCI4,
+	DLCI5,
+	DLCI6,
+	DLCI7,
+	DLCI8,
+	DLCI9,
+	DLCI10,
+	DLCI11,
+	DLCI12,
+	NR_DLCI,
+};
+
+enum modem_command {
+	MODEM_COMMAND_NONE,
+	MODEM_ENABLE_SPEAKER,
+	MODEM_DISABLE_SPEAKER,
+	MODEM_START_CALL,
+};
+
+struct dlci_cmd {
+	const char *cmd;
+	const char *res;
+};
+
+struct dlci {
+	int id;
+	int fd;
+	struct timespec ts;
+	const struct dlci_cmd *cmd;
+	enum modem_state next_state;
+	int nr_cmds;
+	int cur_cmd;
+	int cmd_id;
+};
+
+struct modem {
+	struct dlci *dlcis;
+	enum modem_state state;
+	fd_set read_set;
+	unsigned short msg_id;
+	enum modem_command cmd;
+	char cmd_buf[CMD_BUF_SZ];
 };
 
 static unsigned short msg_id;
@@ -119,6 +175,211 @@ static int stop_ngsm(int fd)
 			strerror(errno));
 		return -1;
 	}
+
+	return 0;
+}
+
+static int dlci_wait(const char *name) {
+	int timeout = 20, fd;
+
+	while (timeout-- > 0) {
+		fd = open(name, O_RDONLY | O_NOCTTY | O_NDELAY);
+		if (fd >= 0) {
+			close(fd);
+			fprintf(stderr, "Found dlci\n");
+
+			return 0;
+		}
+		fprintf(stderr, "Waiting for dlci..\n");
+		sleep(1);
+	}
+
+	return -ETIMEDOUT;
+}
+
+static int dlci_open_all(struct modem *modem)
+{
+	struct dlci *dlci;
+	int error, i, fd;
+	char name[16];
+
+	sprintf(name, "/dev/gsmtty%i", 1);
+	error = dlci_wait(name);
+	if (error) {
+		fprintf(stderr,
+			"Timed out, is phy-mapphone-mdm6600 loaded?\n");
+
+		return error;
+	}
+
+	for (i = 0; i < NR_DLCI; i++) {
+		dlci = &modem->dlcis[i];
+		dlci->id = i + 1;
+
+		sprintf(name, "/dev/gsmtty%i", dlci->id);
+		fd = open(name, O_RDWR | O_NOCTTY | O_NDELAY);
+		if (fd < 0)
+			fprintf(stderr, "Could not open %s: %s\n",
+				name, strerror(errno));
+		dlci->fd = fd;
+	}
+
+	return 0;
+}
+
+static void dlci_close_all(struct modem *modem)
+{
+	struct dlci *dlci;
+	int i, error;
+
+	for (i = 0; i < NR_DLCI; i++) {
+		dlci = &modem->dlcis[i];
+		if (dlci->fd < 0)
+			continue;
+
+		error = close(dlci->fd);
+		if (error)
+			fprintf(stderr, "Could not close dlci%i: %s\n",
+				i, strerror(errno));
+
+		dlci->fd = -ENODEV;
+	}
+}
+
+static int dlci_lock(struct modem *modem, struct dlci *dlci)
+{
+	if (dlci->ts.tv_sec)
+		return -EBUSY;
+
+	dlci->cmd_id = modem->msg_id++;
+
+	return clock_gettime(CLOCK_REALTIME, &dlci->ts);
+}
+
+static void dlci_unlock(struct dlci *dlci)
+{
+	dlci->ts.tv_sec = 0;
+	dlci->cmd_id = 0;
+}
+
+static int dlci_busy(struct dlci *dlci)
+{
+	if (dlci->ts.tv_sec)
+		return 1;
+
+	return 0;
+}
+
+/*
+ * Format is: "UNNNNAT+FOO\r\0" where NNNN is incrementing message ID
+ */
+static int dlci_send_cmd(struct modem *modem, const int dlci_nr,
+			 const char *cmd)
+{
+	struct dlci *dlci;
+	int error;
+
+	if (dlci_nr < 1 || dlci_nr > NR_DLCI)
+		return -EINVAL;
+
+	dlci = &modem->dlcis[dlci_nr - 1];
+
+	error = dlci_lock(modem, dlci);
+	if (error)
+		return error;
+
+	fprintf(stdout, "%i> U%04i%s\r\n", dlci->id, dlci->cmd_id, cmd);
+	dprintf(dlci->fd, "U%04i%s\r", dlci->cmd_id, cmd);
+	fsync(dlci->fd);
+
+	return 0;
+}
+
+static int dlci_handle_response(struct modem *modem, struct dlci *dlci,
+				char *buf, int buf_sz)
+{
+	ssize_t len;
+	char cmd_id[5];
+	int resp = 0, resp_len = 0;
+
+	len = read(dlci->fd, buf, BUF_SZ);
+	if (!len)
+		return 0;
+
+	printf("%i< %s", dlci->id, buf);
+
+	/*
+	 * FIXME: Parse incoming "~+WAKEUP" and notify for "~+CLIP"
+	 * incoming call
+	 */
+	if (len > 6 && buf[5] == '~')
+		return  0;
+
+	if (!dlci->cmd)
+		goto done;
+
+	if (len > 6 && buf[0] == 'U') {
+		snprintf(cmd_id, 5, "%s", buf + 1);
+		resp = atoi(cmd_id);
+	}
+
+	if (resp != dlci->cmd_id)
+		return 0;
+
+	if (dlci->cmd[dlci->cur_cmd].res)
+		resp_len = strlen(dlci->cmd[dlci->cur_cmd].res);
+
+	if (strncmp(dlci->cmd[dlci->cur_cmd].res,
+		     buf + 5, resp_len)) {
+		fprintf(stderr, "No match for U%04i command %s\n",
+		       dlci->cmd_id, dlci->cmd[dlci->cur_cmd].res);
+		return 0;
+	}
+
+	/* No further commends to trigger? */
+	dlci->cur_cmd++;
+	if (dlci->cur_cmd >= dlci->nr_cmds) {
+		if (dlci->next_state) {
+			modem->state = dlci->next_state;
+			dlci->next_state = MODEM_STATE_NONE;
+		}
+		dlci->cmd = NULL;
+		dlci->nr_cmds = 0;
+		dlci->cur_cmd = 0;
+
+		goto done;
+	}
+
+	dlci_unlock(dlci);
+
+	return dlci_send_cmd(modem, dlci->id, dlci->cmd[dlci->cur_cmd].cmd);
+
+done:
+	dlci_unlock(dlci);
+
+	return 0;
+}
+
+#define NSEC_PER_SEC		1000000000LL
+
+static int dlci_handle_timeout(struct modem *modem, struct dlci *dlci,
+			       struct timespec *now, char *buf, int len)
+{
+	long long nsec;
+
+	if (!dlci->ts.tv_sec)
+		return 0;
+
+	nsec = NSEC_PER_SEC * now->tv_sec + now->tv_nsec;
+	nsec -= NSEC_PER_SEC * dlci->ts.tv_sec + dlci->ts.tv_nsec;
+
+	if (nsec / NSEC_PER_SEC < 5)
+		return 0;
+
+	fprintf(stderr, "Timed out on dlci%i for command U%04i\n",
+		dlci->id, dlci->cmd_id);
+	dlci->cmd = NULL;
+	dlci_unlock(dlci);
 
 	return 0;
 }
