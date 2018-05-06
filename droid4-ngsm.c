@@ -313,6 +313,14 @@ static int dlci_handle_response(struct modem *modem, struct dlci *dlci,
 	if (!len)
 		return 0;
 
+	/* Increment message ID to sync to the one from modem */
+	if (len > 6 && buf[0] == 'U') {
+		snprintf(cmd_id, 5, "%s", buf + 1);
+		resp = atoi(cmd_id);
+		if (resp > modem->msg_id)
+			modem->msg_id = resp + 1;
+	}
+
 	/* See modem_wake() above for the polling case */
 	if (len > 11 && !strncmp(buf + 5, "wakeup", 6))
 		return 0;
@@ -328,11 +336,6 @@ static int dlci_handle_response(struct modem *modem, struct dlci *dlci,
 
 	if (!dlci->cmd)
 		goto done;
-
-	if (len > 6 && buf[0] == 'U') {
-		snprintf(cmd_id, 5, "%s", buf + 1);
-		resp = atoi(cmd_id);
-	}
 
 	if (resp != dlci->cmd_id)
 		return 0;
