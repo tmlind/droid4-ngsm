@@ -964,11 +964,10 @@ static int parse_params(struct modem *modem, int argc, char **argv)
 
 int main(int argc, char **argv)
 {
-	struct sigaction handler;
+	struct modem *modem;
 	struct termios t;
 	const char *port = "/dev/ttyS0";
-	enum modem_state state;
-	int fd, error, i;
+	int fd, error;
 	char *buf;
 
 	if (argc > 1 && !strncmp("--help", argv[1], 6)) {
@@ -999,104 +998,52 @@ int main(int argc, char **argv)
 		goto close;
 	}
 
+	modem = calloc(1, sizeof(*modem));
+	if (!modem)
+		goto close;
+
+	modem->dlcis = calloc(NR_DLCI, sizeof(struct dlci));
+	if (!modem->dlcis)
+		goto free_modem;
+
 	buf = malloc(BUF_SZ);
 	if (!buf)
-		goto close;
+		goto free_dlci;
 
-	handler.sa_handler = signal_handler;
-	error = sigfillset(&handler.sa_mask);
+	fprintf(stdout, "Starting ngsm..\n");
+	error = start_ngsm(fd);
 	if (error < 0) {
-		fprintf(stderr, "Could not sigfillset: %s\n",
-			strerror(errno));
-		goto close;
-	}
-
-	handler.sa_flags = 0;
-
-	error = sigaction(SIGINT, &handler, 0);
-	if (error < 0) {
-		fprintf(stderr, "Could not set sigaction: %s\n",
-			strerror(errno));
-		goto close;
-	}
-
-	for (i = 0; i < 10; i++) {
-		fprintf(stdout, "Starting ngsm..\n");
-		error = start_ngsm(fd);
-		if (error < 0) {
-			fprintf(stderr, "Could not start ngsm: %s\n",
-				strerror(-error));
-			goto free;
-		}
-
-		fprintf(stdout, "Testing ngsm.. (few failures are normal)\n");
-		error = test_ngsm(1, "AT+CFUN?", buf, BUF_SZ);
-		if (!error) {
-			fprintf(stdout, "Enable speaker phone..\n");
-			error = enable_speaker_phone(buf, BUF_SZ);
-			if (error)
-				goto disable;
-
-			if (argc < 2)
-				break;
-
-			if (!strncmp("--call=", argv[1], 7)) {
-				fprintf(stdout, "Starting phone call..\n");
-				error = start_phone_call(buf, BUF_SZ, argv[1]);
-				if (error)
-					goto disable;
-				state = MODEM_STATE_CALLING;
-
-				break;
-			}
-
-			break;
-		}
-
-		fprintf(stderr, "Trying to start ngsm again: %s\n",
+		fprintf(stderr, "Could not start ngsm: %s\n",
 			strerror(-error));
-
-		error = stop_ngsm(fd);
-		if (error < 0) {
-			fprintf(stderr, "Could not stop ngsm: %s\n",
-				strerror(-error));
-			goto free;
-		}
-		sleep(1);
-	}
-
-	if (error < 0) {
-		fprintf(stderr, "Timed out starting ngsm\n");
 		goto free;
 	}
 
-	fprintf(stdout, "Started ngsm, press Ctrl-C to exit when done\n");
-	while (1) {
-		if (state == MODEM_STATE_CALLING) {
-			error = test_ngsm(1, "AT+CLCC", buf, BUF_SZ);
-			if (error)
-				break;
-		}
-		if (signal_received)
-			break;
-		sleep(2);
-	}
-
-	if (state == MODEM_STATE_CALLING) {
-		fprintf(stdout, "Hanging up..\n");
-		error = stop_phone_call(buf, BUF_SZ);
-	}
-
-disable:
-	fprintf(stdout, "Disable speaker phone..\n");
-	error = disable_speaker_phone(buf, BUF_SZ);
+	error = dlci_open_all(modem);
 	if (error)
-		fprintf(stderr, "Could not disable speaker phone: %s\n",
+		goto close;
+
+	error = parse_params(modem, argc, argv);
+	if (error)
+		goto close;
+
+	fprintf(stdout, "Started ngsm, press Ctrl-C to exit when done\n");
+	error = handle_io(modem);
+	if (error)
+		fprintf(stderr, "Got IO error: %i\n", error);
+
+	dlci_close_all(modem);
+
+	error = stop_ngsm(fd);
+	if (error < 0)
+		fprintf(stderr, "Could not stop ngsm: %s\n",
 			strerror(-error));
 
 free:
 	free(buf);
-
+free_dlci:
+	free(modem->dlcis);
+free_modem:
+	free(modem);
 close:
 	close(fd);
 
