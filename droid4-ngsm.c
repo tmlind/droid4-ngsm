@@ -254,13 +254,13 @@ static int stop_phone_call(char *buf, size_t buf_sz)
 	error = test_ngsm(1, "ATH", buf, BUF_SZ);
 	if (error)
 		fprintf(stderr, "Could not hang up call: %s\n",
-			strerror(errno));
+			strerror(-error));
 
 	/* List current calls */
 	error = test_ngsm(1, "AT+CLCC", buf, BUF_SZ);
 	if (error)
 		fprintf(stderr, "Could not list current calls: %s\n",
-			strerror(errno));
+			strerror(-error));
 
 	/* Disable radio */
 	error = test_ngsm(1, "AT+CFUN=0", buf, BUF_SZ);
@@ -333,7 +333,7 @@ int main(int argc, char **argv)
 		error = start_ngsm(fd);
 		if (error < 0) {
 			fprintf(stderr, "Could not start ngsm: %s\n",
-				strerror(errno));
+				strerror(-error));
 			goto free;
 		}
 
@@ -362,12 +362,12 @@ int main(int argc, char **argv)
 		}
 
 		fprintf(stderr, "Trying to start ngsm again: %s\n",
-			strerror(errno));
+			strerror(-error));
 
 		error = stop_ngsm(fd);
 		if (error < 0) {
 			fprintf(stderr, "Could not stop ngsm: %s\n",
-				strerror(errno));
+				strerror(-error));
 			goto free;
 		}
 		sleep(1);
@@ -400,7 +400,7 @@ disable:
 	error = disable_speaker_phone(buf, BUF_SZ);
 	if (error)
 		fprintf(stderr, "Could not disable speaker phone: %s\n",
-			strerror(errno));
+			strerror(-error));
 
 free:
 	free(buf);
