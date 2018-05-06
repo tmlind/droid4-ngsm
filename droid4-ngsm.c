@@ -82,8 +82,12 @@ struct modem {
 	struct timespec last_check;
 	unsigned short msg_id;
 	enum modem_command cmd;
+	int oobwake;
 	char cmd_buf[CMD_BUF_SZ];
 };
+
+static void modem_wake(struct modem *modem);
+static void modem_idle(struct modem *modem);
 
 static int signal_received;
 
@@ -289,9 +293,11 @@ static int dlci_send_cmd(struct modem *modem, const int dlci_nr,
 	if (error)
 		return error;
 
+	modem_wake(modem);
 	fprintf(stdout, "%i> U%04i%s\r\n", dlci->id, dlci->cmd_id, cmd);
 	dprintf(dlci->fd, "U%04i%s\r", dlci->cmd_id, cmd);
 	fsync(dlci->fd);
+	modem_idle(modem);
 
 	return 0;
 }
@@ -305,6 +311,10 @@ static int dlci_handle_response(struct modem *modem, struct dlci *dlci,
 
 	len = read(dlci->fd, buf, BUF_SZ);
 	if (!len)
+		return 0;
+
+	/* See modem_wake() above for the polling case */
+	if (len > 11 && !strncmp(buf + 5, "wakeup", 6))
 		return 0;
 
 	printf("%i< %s", dlci->id, buf);
@@ -383,6 +393,44 @@ static int dlci_handle_timeout(struct modem *modem, struct dlci *dlci,
 	dlci_unlock(dlci);
 
 	return 0;
+}
+
+/*
+ * The GPIO line for mdm6600 wake needs to be toggled for 5us to start
+ * mdm6600 wake-up sequence, and then mdm6600 needs 100 - 200ms to respond.
+ * The wake pulse will keep mdm6600 awake about 1.2s. If we don't have the
+ * the GPIO wake working, we can send tree dummy messages that will wake
+ * the modem after few attempts assuming. For a suspended modem, we need
+ * to use the GPIO wake.
+ */
+static void modem_wake(struct modem *modem)
+{
+	struct dlci *dlci;
+	int retries = 3;
+
+	if (modem->oobwake >= 0) {
+		dprintf(modem->oobwake, "on\n");
+		fsync(modem->oobwake);
+
+		return;
+	}
+
+	/* Try to wake modem with polling, this won't work in USB suspend */
+	dlci = &modem->dlcis[DLCI7];
+	while (retries--) {
+		dprintf(dlci->fd, "U%04i%s\r", modem->msg_id++, "wakeup");
+		fsync(dlci->fd);
+		usleep(10000);
+	}
+}
+
+static void modem_idle(struct modem *modem)
+{
+	if (modem->oobwake < 0)
+		return;
+
+	dprintf(modem->oobwake, "auto\n");
+	fsync(modem->oobwake);
 }
 
 static const struct dlci_cmd dlci1_modem_found[] = {
@@ -665,7 +713,7 @@ static int set_modem_state(struct modem *modem)
 		}
 		break;
 	case MODEM_STATE_CALLING:
-		if (&modem->last_dlci.tv_sec - &modem->last_check.tv_sec > 5)
+		if (modem->last_dlci.tv_sec - modem->last_check.tv_sec > 5)
 			modem->last_check = modem->last_dlci;
 		else
 			break;
@@ -814,6 +862,14 @@ static int parse_params(struct modem *modem, int argc, char **argv)
 	return 0;
 }
 
+static void modem_init_oobwake(struct modem *modem)
+{
+	modem->oobwake = open("/sys/devices/platform/usb-phy@1/power/control",
+			      O_RDWR | O_NOCTTY | O_NDELAY);
+	if (modem->oobwake < 0)
+		fprintf(stderr, "No modem PM runtime control found");
+}
+
 int main(int argc, char **argv)
 {
 	struct modem *modem;
@@ -837,19 +893,6 @@ int main(int argc, char **argv)
 		return fd;
 	}
 
-	tcgetattr(fd, &t);
-	cfsetispeed(&t, B115200);
-	cfsetospeed(&t, B115200);
-	t.c_iflag &= ~(IXON | IXOFF);
-	t.c_lflag |= CRTSCTS;
-
-	error = tcsetattr(fd, TCSANOW, &t);
-	if (error < 0) {
-		fprintf(stderr, "Failed to tcsetattr: %s\n",
-			strerror(errno));
-		goto close;
-	}
-
 	modem = calloc(1, sizeof(*modem));
 	if (!modem)
 		goto close;
@@ -862,11 +905,28 @@ int main(int argc, char **argv)
 	if (!buf)
 		goto free_dlci;
 
+	modem_init_oobwake(modem);
+	modem_wake(modem);
+
+	tcgetattr(fd, &t);
+	cfsetispeed(&t, B115200);
+	cfsetospeed(&t, B115200);
+	t.c_iflag &= ~(IXON | IXOFF);
+	t.c_lflag |= CRTSCTS;
+
+	error = tcsetattr(fd, TCSANOW, &t);
+	if (error < 0) {
+		fprintf(stderr, "Failed to tcsetattr: %s\n",
+			strerror(errno));
+		goto free_dlci;
+	}
+
 	fprintf(stdout, "Starting ngsm..\n");
 	error = start_ngsm(fd);
 	if (error < 0) {
 		fprintf(stderr, "Could not start ngsm: %s\n",
 			strerror(-error));
+		modem_idle(modem);
 		goto free;
 	}
 
@@ -877,6 +937,8 @@ int main(int argc, char **argv)
 	error = parse_params(modem, argc, argv);
 	if (error)
 		goto close;
+
+	modem_idle(modem);
 
 	fprintf(stdout, "Started ngsm, press Ctrl-C to exit when done\n");
 	error = handle_io(modem);
@@ -897,6 +959,8 @@ free_dlci:
 free_modem:
 	free(modem);
 close:
+	if (modem->oobwake >= 0)
+		close(modem->oobwake);
 	close(fd);
 
 	return error;
