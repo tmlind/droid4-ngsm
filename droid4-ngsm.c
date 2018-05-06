@@ -68,8 +68,10 @@ static int start_ngsm(int fd)
 	c.mtu = 1024;		/* from android ts27010 driver */
 	c.t1 = 10;		/* ack timer, default 10ms */
 	c.t2 = 34;		/* response timer, default 34 */
-	c.n2 = 3;		/* retransmissions, default 3 */
+	c.n2 = 20;		/* retransmissions, default 3 */
 
+	fprintf(stderr, "Setting initial n2 retransmissions to %i..\n",
+		c.n2);
 	error = ioctl(fd, GSMIOC_SETCONF, &c);
 	if (error) {
 		fprintf(stderr, "Could not set conf: %s\n",
@@ -79,10 +81,20 @@ static int start_ngsm(int fd)
 
 	/*
 	 * Wait a bit for n_gsm to detect the ADM mode based on
-	 * control channel timeouts. Maybe we could have a longer
-	 * initial retries flag, then changne it back to default?
+	 * control channel timeouts.
 	 */
-	sleep(1);
+	sleep(3);
+
+	c.n2 = 3;		/* change back to default value */
+
+	fprintf(stderr, "Setting n2 retransmissions back to default %i..\n",
+		c.n2);
+	error = ioctl(fd, GSMIOC_SETCONF, &c);
+	if (error) {
+		fprintf(stderr, "Could not set conf: %s\n",
+			strerror(errno));
+		return -1;
+	}
 
 	return 0;
 }
