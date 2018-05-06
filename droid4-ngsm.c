@@ -19,6 +19,15 @@
 #include <linux/gsmmux.h>
 #include <linux/tty.h>
 
+#define BUF_SZ		4096
+
+enum modem_state {
+	MODEM_STATE_DISCONNECTED,
+	MODEM_STATE_CONNECTED,
+	MODEM_STATE_CALLING,
+};
+
+static unsigned short msg_id;
 static int signal_received;
 
 static void signal_handler(int sigal) {
@@ -113,9 +122,6 @@ static int stop_ngsm(int fd)
 
 	return 0;
 }
-
-#define BUF_SZ	4096
-static unsigned short msg_id;
 
 /*
  * Format is: "UNNNNAT+FOO\r\0" where NNNN is incrementing message ID
@@ -263,12 +269,6 @@ static int stop_phone_call(char *buf, size_t buf_sz)
 
 	return 0;
 }
-
-enum modem_state {
-	MODEM_STATE_DISCONNECTED,
-	MODEM_STATE_CONNECTED,
-	MODEM_STATE_CALLING,
-};
 
 int main(int argc, char **argv)
 {
