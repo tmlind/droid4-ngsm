@@ -384,6 +384,196 @@ static int dlci_handle_timeout(struct modem *modem, struct dlci *dlci,
 	return 0;
 }
 
+static const struct dlci_cmd dlci1_modem_found[] = {
+	{ .cmd = "AT+CFUN?", .res = "+CFUN=", },
+};
+
+static int modem_test_connected(struct modem *modem)
+{
+	struct dlci *dlci;
+	const struct dlci_cmd *cmds;
+
+	dlci = &modem->dlcis[DLCI1];
+	if (dlci_busy(dlci))
+		return -EAGAIN;
+
+	fprintf(stdout, "Testing if modem is available..\n");
+	cmds = dlci1_modem_found;
+
+	dlci->cmd = cmds;
+	dlci->nr_cmds = 1;
+	dlci->cur_cmd = 0;
+
+	dlci->next_state = MODEM_STATE_CONNECTED;
+
+	return dlci_send_cmd(modem, dlci->id, cmds[0].cmd);
+}
+
+/*
+ * AT+EACC=3,0 enables microphone
+ * AT+CMUT=0 unmutes microphone
+ * AT+NREC=1 enables noise reduction and echo cancellation
+ * AT+CLVL=6 sets volume level 0 to 7
+ */
+static const struct dlci_cmd dlci2_enable_speaker[] = {
+	{ .cmd = "AT+EACC=3,0", .res = "+EACC:OK", },
+	{ .cmd = "AT+CMUT=0", .res = "+CMUT:OK", },
+	{ .cmd = "AT+NREC=1", .res = "+NREC:OK", },
+	{ .cmd = "AT+CLVL=6", .res = "+CLVL:OK", },
+};
+
+static int modem_enable_speaker_phone(struct modem *modem)
+{
+	struct dlci *dlci;
+	const struct dlci_cmd *cmds;
+
+	fprintf(stdout, "Enabling speaker phone..\n");
+	dlci = &modem->dlcis[DLCI2];
+	cmds = dlci2_enable_speaker;
+
+	dlci->cmd = cmds;
+	dlci->nr_cmds = 4;
+	dlci->cur_cmd = 0;
+
+	return dlci_send_cmd(modem, dlci->id, cmds[0].cmd);
+}
+
+static const struct dlci_cmd dlci2_disable_speaker[] = {
+	{ .cmd = "AT+EACC=0,0", .res = "+EACC:", },
+	{ .cmd = "AT+CMUT=1", .res = "+CMUT:", },
+	{ .cmd = "AT+NREC=0", .res = "+NREC:", },
+	{ .cmd = "AT+CLVL=0", .res = "+CLVL:", },
+};
+
+static int modem_disable_speaker_phone(struct modem *modem)
+{
+	struct dlci *dlci;
+	const struct dlci_cmd *cmds;
+
+	fprintf(stdout, "Disabling speaker phone..\n");
+	dlci = &modem->dlcis[DLCI2];
+	cmds = dlci2_disable_speaker;
+
+	dlci->cmd = cmds;
+	dlci->nr_cmds = 4;
+	dlci->cur_cmd = 0;
+
+	return dlci_send_cmd(modem, dlci->id, cmds[0].cmd);
+}
+
+/*
+ * AT+CFUN=1 enables radio
+ * AT+CLCC lists current calls
+ */
+static const struct dlci_cmd dlci1_modem_enable[] = {
+	{ .cmd = "AT+CFUN=1", .res = "+CFUN:OK", },
+	{ .cmd = "AT+CLCC", .res = "+CLCC:", },
+};
+
+static int modem_radio_enable(struct modem *modem)
+{
+	struct dlci *dlci;
+	const struct dlci_cmd *cmds;
+	int error;
+
+	dlci = &modem->dlcis[DLCI1];
+	if (dlci_busy(dlci))
+		return -EAGAIN;
+
+	error = modem_enable_speaker_phone(modem);
+	if (error)
+		return error;
+
+	cmds = dlci1_modem_enable;
+	dlci->cmd = cmds;
+	dlci->nr_cmds = 2;
+	dlci->cur_cmd = 0;
+
+	dlci->next_state = MODEM_STATE_ENABLED;
+
+	return dlci_send_cmd(modem, dlci->id, cmds[0].cmd);
+}
+
+static int modem_start_phone_call(struct modem *modem)
+{
+	struct dlci *dlci;
+	int error;
+
+	dlci = &modem->dlcis[DLCI1];
+	if (dlci_busy(dlci))
+		return -EAGAIN;
+
+	fprintf(stdout, "Starting phone call..\n");
+	error = dlci_send_cmd(modem, dlci->id, modem->cmd_buf);
+	if (error)
+		return error;
+
+	modem->cmd = MODEM_COMMAND_NONE;
+	modem->state = MODEM_STATE_CALLING;
+
+	return 0;
+}
+
+static const struct dlci_cmd dlci1_modem_list_calls[] = {
+	{ .cmd = "AT+CLCC", .res = "+CLCC:", },
+};
+
+static int modem_list_calls(struct modem *modem)
+{
+	struct dlci *dlci;
+	const struct dlci_cmd *cmds;
+
+	dlci = &modem->dlcis[DLCI1];
+	if (dlci_busy(dlci))
+		return -EAGAIN;
+
+	cmds = dlci1_modem_list_calls;
+	dlci->cmd = cmds;
+	dlci->nr_cmds = 1;
+	dlci->cur_cmd = 0;
+
+	return dlci_send_cmd(modem, dlci->id, cmds[0].cmd);
+}
+
+/*
+ * ATH hangs up
+ * AT+CLCC lists current calls
+ * AT+CFUN=0 disables radio
+ */
+static const struct dlci_cmd dlci1_hang_up[] = {
+	{ .cmd = "ATH", .res = "H:", },
+	{ .cmd = "AT+CLCC", .res = "+CLCC:", },
+	{ .cmd = "AT+CFUN=0", .res = "+CFUN:OK", },
+};
+
+static int modem_stop_phone_call(struct modem *modem)
+{
+	struct dlci *dlci;
+	const struct dlci_cmd *cmds;
+	int error;
+
+	dlci = &modem->dlcis[DLCI1];
+	if (dlci_busy(dlci))
+		return -EAGAIN;
+
+	cmds = dlci1_hang_up;
+	dlci->cmd = cmds;
+	dlci->nr_cmds = 3;
+	dlci->cur_cmd = 0;
+
+	dlci->next_state = MODEM_STATE_EXITING;
+
+	error = dlci_send_cmd(modem, dlci->id, cmds[0].cmd);
+	if (error) {
+		fprintf(stderr, "Could not hang up: %s\n",
+			strerror(-error));
+
+		return error;
+	}
+
+        return modem_disable_speaker_phone(modem);
+}
+
 /*
  * Format is: "UNNNNAT+FOO\r\0" where NNNN is incrementing message ID
  *
