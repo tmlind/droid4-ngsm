@@ -78,6 +78,8 @@ struct modem {
 	struct dlci *dlcis;
 	enum modem_state state;
 	fd_set read_set;
+	struct timespec last_dlci;
+	struct timespec last_check;
 	unsigned short msg_id;
 	enum modem_command cmd;
 	char cmd_buf[CMD_BUF_SZ];
@@ -717,6 +719,245 @@ static int stop_phone_call(char *buf, size_t buf_sz)
 	error = test_ngsm(1, "AT+CFUN=0", buf, BUF_SZ);
 	if (error)
 		return error;
+
+	return 0;
+}
+
+static int handle_stdin(struct modem *modem, char *buf, int buf_sz)
+{
+	struct dlci *dlci;
+	ssize_t len;
+	int dlci_nr, error;
+	char *cmd;
+
+	len = read(STDIN_FILENO, buf, buf_sz);
+	if (len < 3)
+		return 0;
+
+	cmd = strchr(buf, ' ');
+	if (!cmd)
+		return 0;
+
+	cmd[0] = '\0';
+	cmd++;
+	len = strlen(cmd);
+	cmd[len - 1] = '\0';
+	dlci_nr = atoi(buf);
+
+	if (dlci_nr < 1 || dlci_nr > NR_DLCI)
+		return 0;
+
+	dlci = &modem->dlcis[dlci_nr - 1];
+
+	error = dlci_send_cmd(modem, dlci->id, cmd);
+	if (error)
+		fprintf(stderr, "Error sending command: %i\n", error);
+
+	return 0;
+}
+
+static int handle_dlci(struct modem *modem, char *buf, int len)
+{
+	struct dlci *dlci;
+	int error, i;
+
+	error = clock_gettime(CLOCK_REALTIME, &modem->last_dlci);
+	if (error)
+		return error;
+
+	for (i = 0; i < NR_DLCI; i++) {
+		dlci = &modem->dlcis[i];
+
+		/* Data at DLCI? */
+		if (FD_ISSET(dlci->fd, &modem->read_set)) {
+			error = dlci_handle_response(modem, dlci, buf, len);
+			if (error)
+				fprintf(stderr, "Error handling response: %i\n",
+					error);
+		}
+
+		/* Command for DLCI timed out? */
+		error = dlci_handle_timeout(modem, dlci,
+					    &modem->last_dlci, buf, len);
+		if (error)
+			fprintf(stderr, "Error handling timeout: %i\n",
+				error);
+	}
+
+	return 0;
+}
+
+static int set_modem_state(struct modem *modem)
+{
+	int error = 0;
+
+	switch (modem->state) {
+	case MODEM_STATE_NONE:
+	case MODEM_STATE_DISCONNECTED:
+		error = modem_test_connected(modem);
+		if (error && error != -EAGAIN)
+			modem->state = MODEM_STATE_EXITING;
+		break;
+	case MODEM_STATE_CONNECTED:
+		if (modem->cmd == MODEM_START_CALL) {
+			error = modem_radio_enable(modem);
+			if (error && error != -EAGAIN)
+				modem->state = MODEM_STATE_EXITING;
+		}
+		break;
+	case MODEM_STATE_ENABLED:
+		if (modem->cmd == MODEM_START_CALL) {
+			error = modem_start_phone_call(modem);
+			if (error && error != -EAGAIN)
+				modem->state = MODEM_STATE_DISABLED;
+		}
+		break;
+	case MODEM_STATE_CALLING:
+		if (&modem->last_dlci.tv_sec - &modem->last_check.tv_sec > 5)
+			modem->last_check = modem->last_dlci;
+		else
+			break;
+		error = modem_list_calls(modem);
+		if (error && error != -EAGAIN)
+			modem->state = MODEM_STATE_DISABLED;
+		break;
+	case MODEM_STATE_DISABLED:
+		error = modem_stop_phone_call(modem);
+		if (error && error != -EAGAIN)
+			modem->state = MODEM_STATE_EXITING;
+		break;
+	case MODEM_STATE_EXITING:
+		fprintf(stdout, "Exiting..\n");
+		error = -EINTR;
+	}
+
+	return error;
+}
+
+static int handle_io(struct modem *modem)
+{
+	struct dlci *dlci;
+	struct timespec ts;
+	struct sigaction handler;
+	sigset_t sigmask, emptymask;
+	char *cmd_buf, *dlci_buf;
+	int error, i, timeout;
+
+	cmd_buf = malloc(BUF_SZ);
+	if (!cmd_buf)
+		return -ENOMEM;
+
+	dlci_buf = malloc(BUF_SZ);
+	if (!dlci_buf) {
+		free(cmd_buf);
+
+		return -ENOMEM;
+	}
+
+	handler.sa_handler = signal_handler;
+	handler.sa_flags = 0;
+	error = sigfillset(&handler.sa_mask);
+	if (error < 0) {
+		fprintf(stderr, "Could not sigfillset: %s\n",
+			strerror(errno));
+		goto free;
+	}
+
+
+	error = sigaction(SIGINT, &handler, 0);
+	if (error < 0) {
+		fprintf(stderr, "Could not set sigaction: %s\n",
+			strerror(errno));
+		goto free;
+	}
+
+	sigemptyset(&sigmask);
+	sigaddset(&sigmask, SIGINT);
+
+	error = sigprocmask(SIG_BLOCK, &sigmask, NULL);
+	if (error < 0) {
+		fprintf(stderr, "Could not set sigprocmask: %s\n",
+			strerror(errno));
+		goto free;
+	}
+
+	sigemptyset(&emptymask);
+
+	while (1) {
+		FD_ZERO(&modem->read_set);
+		FD_SET(STDIN_FILENO, &modem->read_set);
+
+		for (i = 0; i < NR_DLCI; i++) {
+			dlci = &modem->dlcis[i];
+			if (dlci->fd > 0 && dlci->id != 8)
+				FD_SET(dlci->fd, &modem->read_set);
+		}
+
+		switch (modem->state) {
+		case MODEM_STATE_CONNECTED:
+			timeout = 10;
+		case MODEM_STATE_CALLING:
+			timeout = 3;
+		default:
+			timeout = 1;
+			break;
+		}
+
+		ts.tv_sec = timeout;
+		ts.tv_nsec = 0;
+		memset(cmd_buf, '\0', BUF_SZ);
+		memset(dlci_buf, '\0', BUF_SZ);
+
+		error = pselect(modem->dlcis[NR_DLCI - 1].fd + 1,
+				&modem->read_set, NULL, NULL, &ts,
+				&emptymask);
+                if (signal_received || (error < 0)) {
+			signal_received = 0;
+			if (modem->state == MODEM_STATE_CALLING)
+				modem->state = MODEM_STATE_DISABLED;
+			else
+				modem->state = MODEM_STATE_EXITING;
+		}
+
+		error = handle_dlci(modem, dlci_buf, BUF_SZ);
+		if (error)
+			break;
+
+		/* Data at stdin? */
+		if (FD_ISSET(STDIN_FILENO, &modem->read_set)) {
+			error = handle_stdin(modem, cmd_buf, BUF_SZ);
+			if (error)
+				break;
+		}
+
+		error = set_modem_state(modem);
+		if (error && error != -EAGAIN)
+			break;
+	}
+free:
+	free(dlci_buf);
+	free(cmd_buf);
+
+	return 0;
+}
+
+static int parse_params(struct modem *modem, int argc, char **argv)
+{
+	char *buf;
+
+	if (argc > 1 && !strncmp("--call=", argv[1], 7)) {
+		buf = argv[1];
+		if (strlen(buf) > CMD_BUF_SZ - 3)
+			return -EINVAL;
+
+		if (strlen(buf) > 7 &&
+		    !strncmp("--call=", buf, 7))
+			sprintf(modem->cmd_buf, "ATD%s", buf + 7);
+		else
+			sprintf(modem->cmd_buf, "ATD%s", buf);
+
+		modem->cmd = MODEM_START_CALL;
+	}
 
 	return 0;
 }
